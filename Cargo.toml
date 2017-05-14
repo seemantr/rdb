@@ -1,0 +1,19 @@
+[package]
+name = "rdb"
+version = "0.1.0"
+authors = ["Seemant Rajvanshi <seemant.rajvanshi@gmail.com>"]
+repository = "https://github.com/seemantr/rdb.git"
+license = "Apache 2.0"
+description = "An embedded key/value database for Rust"
+
+[dependencies]
+clippy = {version = "*", optional = true}
+memmap = "0.5.2"
+lazy_static = "0.2.8"
+bitflags = "0.8.2"
+quick-error = "1.2.0"
+fs2 = "0.4.1"
+
+[features]
+default = []
+dev = ["clippy"]
