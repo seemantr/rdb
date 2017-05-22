@@ -11,11 +11,14 @@
         missing_copy_implementations,
         trivial_casts,
 //trivial_numeric_casts, //bitflags fails this lint
-        unsafe_code,
+//unsafe_code,
+//dead_code,
         unused_extern_crates,
         unused_import_braces,
         unused_allocation,
         unused_qualifications)]
+
+#![allow(dead_code)]
 
 #[macro_use]
 extern crate lazy_static;
@@ -31,6 +34,7 @@ extern crate fs2;
 //mod node;
 //mod bucket;
 //mod transaction;
-//mod page;
+mod page;
 mod errors;
+mod constants;
 mod db;

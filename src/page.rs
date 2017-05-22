@@ -1,10 +1,10 @@
 use std::mem::size_of;
 use db::Meta;
+use constants::*;
+use std::ptr;
 
 // A page number in the database
 pub type PageId = u64;
-
-const MIN_KEYS_PER_PAGE: u16 = 2;
 
 lazy_static! {
     static ref BRANCH_PAGE_ELEMENT_SIZE : usize = size_of::<BranchPageElement>();
@@ -23,12 +23,17 @@ bitflags! {
 }
 
 #[derive(Debug)]
-pub struct Page {
+#[repr(C, packed)]
+pub struct PageHeader {
     id: PageId,
     flags: u16,
     count: u16,
     overflow: u32,
-    meta: *const Meta
+}
+
+pub struct Page<'a> {
+    pub header: PageHeader,
+    pub data: &'a [u8],
 }
 
 // BranchPageElement represents a node on a branch page
@@ -37,6 +42,12 @@ struct BranchPageElement {
     position: u32,
     key_size: u32,
     page_id: PageId,
+}
+
+impl BranchPageElement {
+    fn from_page(page: &Page) -> BranchPageElement {
+        unsafe { ptr::read(page.data.as_ptr() as *const _) }
+    }
 }
 
 // leafPageElement represents a node on a leaf page.
@@ -48,3 +59,8 @@ struct LeafPageElement {
     vsize: u32,
 }
 
+impl LeafPageElement {
+    fn from_page(page: &Page) -> LeafPageElement {
+        unsafe { ptr::read(page.data.as_ptr() as *const _) }
+    }
+}

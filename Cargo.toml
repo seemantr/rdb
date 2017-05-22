@@ -1,5 +1,5 @@
 [package]
-name = "rdb"
+name = "ozonedb"
 version = "0.1.0"
 authors = ["Seemant Rajvanshi <seemant.rajvanshi@gmail.com>"]
 repository = "https://github.com/seemantr/rdb.git"
