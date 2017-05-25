@@ -26,7 +26,7 @@ pub const VERSION: u32 = 1;
 // MaxKeySize is the maximum length of a key, in bytes. The database is
 // idelly suited for smaller keys as we will be able to cahce more keys in
 // memory. With utf8 encoding characters can be 1 to 4 bytes long, so worst
-// case scenario we can have 255/4 ~= 63 character keys. 
+// case scenario we can have 255/4 ~= 63 character keys.
 pub const MAX_KEY_SIZE: u32 = 255;
 
 // MaxValueSize is the maximum length of a value, in bytes

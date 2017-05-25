@@ -3,23 +3,9 @@ use db::Meta;
 use constants::*;
 use std::ptr;
 
-// A page number in the database
-pub type PageId = u64;
-
 lazy_static! {
     static ref BRANCH_PAGE_ELEMENT_SIZE : usize = size_of::<BranchPageElement>();
     static ref LEAF_PAGE_ELEMENT_SIZE : usize = size_of::<LeafPageElement>();
-}
-
-bitflags! {
-// The below flags are used to represent the page type
-    flags Page_Flags : u16 {
-        const BRANCH        = 1,
-        const LEAF          = 2,
-        const META          = 4,
-        const FREELIST      = 8,
-        const BUCKET_LEAF   = 16,
-    }
 }
 
 #[derive(Debug)]

@@ -26,15 +26,13 @@ extern crate lazy_static;
 #[macro_use]
 extern crate bitflags;
 
-#[macro_use]
-extern crate quick_error;
 extern crate memmap;
 extern crate fs2;
 
 //mod node;
 //mod bucket;
 //mod transaction;
-mod page;
+//mod page;
 mod errors;
 mod constants;
 mod db;

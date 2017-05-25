@@ -1,273 +1,331 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use errors::DbError;
-use std::io::Error;
+use errors::Error;
 use std::hash::{Hash, Hasher};
-use std::time::Duration;
 use memmap::{Mmap, Protection};
 use std::fs::{OpenOptions, metadata};
-use std::io::prelude::*;
 use fs2::FileExt;
-use std::os;
-use std::mem;
-use std::ptr;
+use std::{mem, ptr, slice};
 use constants::*;
-use page::PageId;
-use page;
+use std::path::Path;
 
-// Bucket represents the on-file representation of a bucket.
-// This is stored as the "value" of a bucket key. If the bucket is small enough,
-// then its root page can be stored inline in the "value", after the bucket
-// header. In the case of inline buckets, the "root" will be 0.
+//--------------------------------------------------------------------
+// Type aliases
+//--------------------------------------------------------------------
+// A page number in the database. u32 should be more than enough to define
+// page numbers as u32 MAX value is 2147483647. Our page size is 4KB so u32
+// gives us the capability to address upto 15.9 TB of data. This is more than
+// enough as one should start thinking about sharding the data at anywhere near
+// 1 TB mark.
+type PageId = u32;
+
+/// Pointer to the first byte of the Page.
+type PagePtr = *const u8;
+
+/// Mutable pointer to the first byte of the Page
+type MutPagePtr = *mut u8;
+
+//--------------------------------------------------------------------
+// Helper methods
+//--------------------------------------------------------------------
+/// Get the raw byte representation of a struct
+unsafe fn to_slice<'a, T>(p: *const u8) -> &'a [u8] {
+    slice::from_raw_parts(p, mem::size_of::<T>())
+}
+
+/// Create an struct from the pointer
+fn from_ptr<T>(p: *const u8) -> T {
+    unsafe { ptr::read(p as *const T) }
+}
+
+/// Create an struct from the pointer
+fn from_ptr_with_offset<T>(p: *const u8, offset: isize) -> T {
+    unsafe { ptr::read(p.offset(offset) as *const T) }
+}
+
+
+/// Generic hash generator
+fn hash<T: Hash>(t: &T) -> u64 {
+    let mut s = DefaultHasher::new();
+    t.hash(&mut s);
+    s.finish()
+}
+//--------------------------------------------------------------------
+
+/// Represents the metadata record for the database. This record
+/// is appended at the beginning of each database file. It also contains
+/// the header information about the database. There are two copies of
+/// this at the beginning of the file.
 #[derive(Debug, Copy, Clone, Hash)]
-pub struct Bucket {
-    // Page id of the bucket's root-level page
+#[repr(C)]
+pub struct Meta {
+    /// Magic int value to idenfify if the file is for the database
+    magic: u32,
+    version: u32,
+    flags: u32,
+    page_size: u32,
+    checksum: u64,
+    transaction_id: u64,
+    little_endian: bool,
     root: PageId,
-    // Monotonically incrementing, used by NextSequence()
-    sequence: u64,
-    transaction: *const Transaction,
+    freelist: PageId,
+    pgid: PageId,
 }
 
-// TransactionId represents the internal transaction identifier.
-type TransactionId = u64;
-
-// Tx represents a read-only or read/write transaction on the database.
-// Read-only transactions can be used for retrieving values for keys and creating cursors.
-// Read/write transactions can create and remove buckets and create and remove keys.
-//
-// IMPORTANT: You must commit or rollback transactions when you are done with
-// them. Pages can not be reclaimed by the writer until no more transactions
-// are using them. A long running read transaction can cause the database to
-// quickly grow.
-#[derive(Debug, Copy, Clone)]
-pub struct Transaction {
-    writable: bool,
-    managed: bool,
-    db: *const Db,
-    meta: *const Meta,
-    root: Bucket,
-    //pages: *const HashMap<PageId, *const page::Page>,
-    stats: TxStats,
-    //CommitHandlers: [],
-
-	// WriteFlag specifies the flag for write-related methods like WriteTo().
-	// Tx opens the database file with the specified flag to copy the data.
-	//
-	// By default, the flag is unset, which works well for mostly in-memory
-	// workloads. For databases that are much larger than available RAM,
-	// set the flag to syscall.O_DIRECT to avoid trashing the page cache.
-    write_flag: u32,
-}
-
-impl Transaction {
-    fn init(mut self, db: *const Db) {
-        self.db = db;
-        //self.pages = &HashMap::new();
-        //self.meta =
+impl Meta {
+    fn default() -> Meta {
+        Meta {
+            magic: MAGIC_KEY,
+            version: VERSION,
+            flags: 0,
+            page_size: OS_PAGE_SIZE as u32,
+            checksum: 0,
+            little_endian: cfg!(target_endian = "little"),
+            root: 0,
+            freelist: 0,
+            transaction_id: 0,
+            pgid: 0,
+        }
     }
-}
-// TxStats represents statistics about the actions performed by the transaction.
-#[derive(Debug, Copy, Clone)]
-struct TxStats {
-    page_count: u32,
+
+    // Validate that that given header is in the right format
+    fn validate(&self) -> Result<(), Error> {
+        if self.magic != MAGIC_KEY {
+            return Err(Error::DatabaseInvalid);
+        }
+        if self.version != VERSION {
+            return Err(Error::DatabaseVersionMismatch);
+        }
+        if self.checksum != 0 && self.checksum != hash(&self) {
+            return Err(Error::ChecksumError);
+        }
+        Ok(())
+    }
 }
 
 // Settings represents the options that can be set when opening a database.
+#[derive(Debug)]
 pub struct Settings {
-    // Timeout is the amount of time to wait to obtain a file lock.
-    // When set to zero it will wait indefinitely. This option is only
-    // available on Darwin and Linux.
-    timeout: Duration,
+    /// Create database if it doesn't exist
+    auto_create: bool,
 
-    // Sets the DB.NoGrowSync flag before memory mapping the file.
-    no_grow_sync: bool,
-
-    // Open database in read-only mode. Uses flock(..., LOCK_SH |LOCK_NB) to
-    // grab a shared lock (UNIX).
+    // Open database in read-only mode. No file locks will be issued on the
+    // database file.
     read_only: bool,
 
-    // Sets the DB.MmapFlags flag before memory mapping the file.
-    mmap_flags: u32,
-
-    // InitialMmapSize is the initial mmap size of the database
-    // in bytes. Read transactions won't block write transaction
-    // if the InitialMmapSize is large enough to hold database mmap
-    // size. (See DB.Begin for more information)
-    //
-    // If <=0, the initial map size is 0.
-    // If initialMmapSize is smaller than the previous database size,
-    // it takes no effect.
+    // Initial Mmap Size is the initial mmap size of the database
+    // in bytes. It is a helpful hint to preallocate the memmap. This
+    // will avoid mmap resizing.
+    // If <=0, the initial map size is the minimum required for the headers
+    // and other metadata.
+    // If size is smaller than the previous database size, it takes no effect.
     initial_mmap_size: u32,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
-            timeout: Duration::new(0, 0),
-            no_grow_sync: false,
-            read_only: true,
-            mmap_flags: 0,
+            auto_create: true,
+            read_only: false,
             initial_mmap_size: 0,
         }
     }
 }
 
-// DB represents a collection of buckets persisted to a file on disk.
-// All data access is performed through transactions which can be obtained through the DB.
-// All the functions on DB will return a ErrDatabaseNotOpen if accessed before Open() is called.
+// DB represents the database persisted to a file on disk.
 #[derive(Debug)]
 pub struct Db {
-    // When enabled, the database will perform a Check() after every commit.
-    // A panic is issued if the database is in an inconsistent state. This
-    // flag has a large performance impact so it should only be used for
-    // debugging purposes.
-    strict_mode: bool,
-
-    // Setting the NoSync flag will cause the database to skip fsync()
-    // calls after each commit. This can be useful when bulk loading data
-    // into a database and you can restart the bulk load in the event of
-    // a system failure or database corruption. Do not set this flag for
-    // normal use.
-    //
-    // If the package global IgnoreNoSync constant is true, this value is
-    // ignored.  See the comment on that constant for more details.
-    //
-    // THIS IS UNSAFE. PLEASE USE WITH CAUTION.
-    no_sync: bool,
-
-    // When true, skips the truncate call when growing the database.
-    // Setting this to true is only safe on non-ext3/ext4 systems.
-    // Skipping truncation avoids preallocation of hard drive space and
-    // bypasses a truncate() and fsync() syscall on remapping.
-    no_grow_sync: bool,
-
-    // If you want to read the entire database fast, you can set MmapFlag to
-    // syscall.MAP_POPULATE on Linux 2.6.23+ for sequential read-ahead.
-    mmap_flags: u32,
-
-    // MaxBatchSize is the maximum size of a batch. Default value is
-    // copied from DefaultMaxBatchSize in Open.
-    //
-    // If <=0, disables batching.
-    //
-    // Do not change concurrently with calls to Batch.
-    max_batch_size: u32,
-
-    // MaxBatchDelay is the maximum delay before a batch starts.
-    // Default value is copied from DefaultMaxBatchDelay in Open.
-    //
-    // If <=0, effectively disables batching.
-    //
-    // Do not change concurrently with calls to Batch.
-    max_batch_delay: u32,
-
-    // AllocSize is the amount of space allocated when the database
-    // needs to create new pages. This is done to amortize the cost
-    // of truncate() and fsync() when growing the data file.
-    alloc_size: u32,
-
+    // The path to the folder which contains the database. If folder
+    // doesn't exist then it will be created automatically.
     path: String,
-    mmap: Mmap,
-    meta0: *mut Meta,
-    meta1: *mut Meta,
-    page_size: usize,
-    opened: bool,
+    // The physical file containing the data related to keys
+    data: Mmap,
+    // Meta 0 page pointing to the root of the tree
+    meta0: Meta,
+    // Meta 1 page pointing to the root of the tree
+    meta1: Meta,
+    settings: Settings,
 }
 
 impl Db {
-    fn open(path: &str, settings: Option<Settings>) -> Result<(), Error> {
-        let settings = match settings {
-            Some(s) => s,
-            None => Default::default(),
-        };
+    /// Create a new database file
+    fn create(path: &Path, settings: &Settings) -> Result<(), Error> {
+        let data_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
 
-        let file = OpenOptions::new()
+        // Set length for at least 4 pages
+        data_file.set_len(OS_PAGE_SIZE as u64 * 4)?;
+        let mut data_mmap = Mmap::open(&data_file, Protection::ReadWrite)?;
+
+        // Create meta0 at page 1
+        let meta0: &mut Meta = unsafe { mem::transmute(data_mmap.mut_ptr()) };
+        *meta0 = Meta::default();
+
+        // Create meta1 at page 2
+        let meta1: &mut Meta =
+            unsafe { mem::transmute(data_mmap.mut_ptr().offset(OS_PAGE_SIZE as isize)) };
+        *meta1 = Meta::default();
+        Ok(())
+    }
+
+    /// Initalize a database for use
+    pub fn init(path: &Path, settings: &Settings) -> Result<(), Error> {
+
+        let data_file = OpenOptions::new()
             .read(true)
             .write(!settings.read_only)
             .create(!settings.read_only)
             .open(path)?;
 
-        // Lock file so that other processes using Rdb in read-write mode cannot
+        let protection_mode = if settings.read_only {
+            Protection::Read
+        } else {
+            Protection::ReadWrite
+        };
+        let data_mmap = Mmap::open(&data_file, protection_mode)?;
+
+        // Lock file so that other processes using the database in read-write mode cannot
         // use the database  at the same time. This would cause corruption since
         // the two processes would write meta pages and free pages separately.
-        // The database file is locked exclusively (only one process can grab the lock)
-        // if !options.ReadOnly.
+        // The database file is locked exclusively (only one process can grab the lock).
         if !settings.read_only {
-            file.lock_exclusive()?;
+            data_file.lock_exclusive()?;
         }
 
         let meta_data = metadata(path)?;
         if meta_data.len() == 0 {}
 
-        // Set default values for later DB operations.
-        //db.alloc_size = DefaultAl
         Ok(())
     }
 
-    // init creates a new database file and initializes its meta pages.
-    fn init(&mut self) -> Result<(), Error> {
-        self.page_size = OS_PAGE_SIZE;
-        let buffer: [u8; OS_PAGE_SIZE as usize] = [0u8; OS_PAGE_SIZE as usize];
-        for n in 0..2 {}
-        Ok(())
+    /// Open a database
+    ///
+    /// A new database will be created if no database is found at the location.
+    pub fn open(path: &str, settings: Option<Settings>) -> Result<(), Error> {
+        let settings = match settings {
+            Some(s) => s,
+            None => Default::default(),
+        };
+
+        let data_file_path = Path::new(path);
+        match (data_file_path.exists(), settings.auto_create) {
+            (false, false) => Err(Error::DatabaseNotFound),
+            (false, true) => Db::create(data_file_path, &settings),
+            (true, _) => Db::init(data_file_path, &settings),
+        }
     }
 
-    // page retrieves a page reference from the mmap based on the current page size.
-    unsafe fn page(&mut self, id: PageId) -> page::Page {
+    /// Checks if a given page is within the bounds of the memory map
+    fn check_bounds(&self, id: PageId) {
+        assert!(self.data.len() >= OS_PAGE_SIZE as usize * id as usize);
+    }
+
+    /// Returns a pointer to the specific page of the mapped memory.
+    unsafe fn page_ptr(&self, id: PageId) -> *const u8 {
+        if id == 0 {
+            return self.data.ptr();
+        }
+        self.check_bounds(id);
         let offset = OS_PAGE_SIZE as isize * id as isize;
-        let header_pointer = self.mmap.ptr().offset(offset);
-        let data_pointer = self.mmap
-            .ptr()
-            .offset(offset + mem::size_of::<page::PageHeader>() as isize);
-        page::Page {
-            header: ptr::read(header_pointer as *const _),
-            data: ptr::read(data_pointer as *const _),
+        self.data.ptr().offset(offset)
+    }
+
+    /// Returns a mut pointer to the specific page of the mapped memory.
+    unsafe fn page_mut_ptr(&mut self, id: PageId) -> *mut u8 {
+        if id == 0 {
+            return self.data.mut_ptr();
         }
+        self.check_bounds(id);
+        let offset = OS_PAGE_SIZE as isize * id as isize;
+        self.data.mut_ptr().offset(offset)
     }
 }
-/*
 
-    fn meta(mut self) -> *mut Meta {
-        // We have to return the meta with the highest txid which doesn't fail
-	    // validation. Otherwise, we can cause errors when in fact the database is
-	    // in a consistent state. metaA is the one with the higher txid.
-        if *self.meta1.txid > *self.meta0.txid {
-            return self.meta1.Clone();
-        }
-        self.meta0.Clone();
-    }*/
-
-#[derive(Debug, Copy, Clone, Hash)]
-pub struct Meta {
-    magic: u32,
-    version: u32,
-    page_size: u32,
-    flags: u32,
-    root: Bucket,
-    freelist: PageId,
-    pgid: PageId,
-    txid: TransactionId,
-    checksum: u64,
-}
-
-// Generic hash generator
-fn hash<T: Hash>(t: &T) -> u64 {
-    let mut s = DefaultHasher::new();
-    t.hash(&mut s);
-    s.finish()
-}
-
-impl Meta {
-    fn validate(&self) -> Result<(), DbError> {
-        if self.magic != MAGIC_KEY {
-            return Err(DbError::Invalid);
-        }
-        if self.version != VERSION {
-            return Err(DbError::VersionMismatch);
-        }
-        if self.checksum != 0 && self.checksum != hash(&self) {
-            return Err(DbError::Checksum);
-        }
-        Ok(())
+//--------------------------------------------------------------------
+// Memory map Page management
+//--------------------------------------------------------------------
+bitflags! {
+/// Flags used to represent the page type
+    flags PageFlags : u32 {
+        /// Metadata page which contains the location of the lookup page
+        const PAGE_META      = 1,
+        /// Page which contains the array lookup to the list pages
+        const PAGE_LOOKUP    = 2,
+        /// Page containg the actual skip list
+        const PAGE_LIST      = 4,
+        /// Page which contains the information about the free pages
+        const PAGE_FREELIST  = 8,
+        /// Page containing the value data
+        const PAGE_DATA      = 16,
+        /// Overflow page used in case the value is larger than the block
+        const PAGE_OVERFLOW  = 32,
+        /// Deleted page
+        const PAGE_DELETED   = 64,
     }
 }
+
+/// A page is usually 4096 bytes and maps to a block on the physical disk. Since
+/// we are using mmap this will point to a location on the mmap.
+///
+/// Page layout in memory
+///
+///    --------------------------------------------------------------------------
+///   | flags (32) | overflow page (32) | page specific data (4096 - 64 = 4032) |
+///   --------------------------------------------------------------------------
+
+const OFFSET_OVERFLOW: isize = 32;
+const OFFSET_PAGEDATA: isize = 64;
+
+struct Page {
+    ptr: PagePtr,
+    id: PageId,
+}
+
+impl Page {
+    /// Create a new page from the pointer
+    fn new(id: PageId, ptr: MutPagePtr) -> Page {
+        Page { ptr: ptr, id: id }
+    }
+
+    /// Returns the overflow page if one exists
+    fn overflow_page(&self) -> Option<PageId> {
+        match from_ptr_with_offset::<PageId>(self.ptr, OFFSET_OVERFLOW) {
+            x if x > 0 => Some(x),
+            _ => None,
+        }
+    }
+
+    /// Returns the type of the page from the pointer to the beginning of the page
+    fn page_flags(&self) -> PageFlags {
+        from_ptr(self.ptr)
+    }
+}
+
+/// PageArray contains pointers to the first element of each data page. Page are
+/// 4096 bytes and can contain upto 200 keys. So, PageArray will have pointers
+/// to each of the valid pages in the system.
+/// A level can span across multiple pages. It offers functionality similar to
+/// a skiplist level but does use probablity to determine which keys should be promoted
+/// to higher level. In this sense it allows faster search using Binary search.
+///
+/// Due to the inherent array like nature these offer O(1) access to an element.
+#[derive(Debug)]
+struct PageArray {
+    /// Pointers to all the data pages
+    page_ptrs: Vec<*const u8>,
+    /// Overall capactity across all the pages
+    capacity: i64,
+    /// Currently occupied elements
+    length: i64,
+}
+
+impl PageArray {
+    fn new(ptr: PagePtr) -> PageArray {
+        //assert!(Db::page_type_from_ptr(ptr) == PAGE_LOOKUP);
+        // Lookup { page: vec![page], capacity: 0, length: 0, element: vec![] }
+        unimplemented!()
+    }
+}
+
