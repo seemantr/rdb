@@ -13,6 +13,10 @@ lazy_static = "0.2.8"
 bitflags = "0.8.2"
 fs2 = "0.4.1"
 
+[dev-dependencies]
+quickcheck = "*"
+quickcheck_macros = "*"
+
 [features]
 default = []
 dev = ["clippy"]

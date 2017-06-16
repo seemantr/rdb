@@ -4,9 +4,11 @@ use std::hash::{Hash, Hasher};
 use memmap::{Mmap, Protection};
 use std::fs::{OpenOptions, metadata};
 use fs2::FileExt;
-use std::{mem, ptr, slice};
+use std::{marker, mem, ptr, slice};
+use std::ops::Deref;
 use constants::*;
 use std::path::Path;
+use enc;
 
 //--------------------------------------------------------------------
 // Type aliases
@@ -23,25 +25,6 @@ type PagePtr = *const u8;
 
 /// Mutable pointer to the first byte of the Page
 type MutPagePtr = *mut u8;
-
-//--------------------------------------------------------------------
-// Helper methods
-//--------------------------------------------------------------------
-/// Get the raw byte representation of a struct
-unsafe fn to_slice<'a, T>(p: *const u8) -> &'a [u8] {
-    slice::from_raw_parts(p, mem::size_of::<T>())
-}
-
-/// Create an struct from the pointer
-fn from_ptr<T>(p: *const u8) -> T {
-    unsafe { ptr::read(p as *const T) }
-}
-
-/// Create an struct from the pointer
-fn from_ptr_with_offset<T>(p: *const u8, offset: isize) -> T {
-    unsafe { ptr::read(p.offset(offset) as *const T) }
-}
-
 
 /// Generic hash generator
 fn hash<T: Hash>(t: &T) -> u64 {
@@ -216,31 +199,6 @@ impl Db {
             (true, _) => Db::init(data_file_path, &settings),
         }
     }
-
-    /// Checks if a given page is within the bounds of the memory map
-    fn check_bounds(&self, id: PageId) {
-        assert!(self.data.len() >= OS_PAGE_SIZE as usize * id as usize);
-    }
-
-    /// Returns a pointer to the specific page of the mapped memory.
-    unsafe fn page_ptr(&self, id: PageId) -> *const u8 {
-        if id == 0 {
-            return self.data.ptr();
-        }
-        self.check_bounds(id);
-        let offset = OS_PAGE_SIZE as isize * id as isize;
-        self.data.ptr().offset(offset)
-    }
-
-    /// Returns a mut pointer to the specific page of the mapped memory.
-    unsafe fn page_mut_ptr(&mut self, id: PageId) -> *mut u8 {
-        if id == 0 {
-            return self.data.mut_ptr();
-        }
-        self.check_bounds(id);
-        let offset = OS_PAGE_SIZE as isize * id as isize;
-        self.data.mut_ptr().offset(offset)
-    }
 }
 
 //--------------------------------------------------------------------
@@ -252,7 +210,7 @@ bitflags! {
         /// Metadata page which contains the location of the lookup page
         const PAGE_META      = 1,
         /// Page which contains the array lookup to the list pages
-        const PAGE_LOOKUP    = 2,
+        const PAGE_INDEX     = 2,
         /// Page containg the actual skip list
         const PAGE_LIST      = 4,
         /// Page which contains the information about the free pages
@@ -266,6 +224,52 @@ bitflags! {
     }
 }
 
+trait PageWriter {}
+
+/// Page array abstracts the memory map into pages of 4KB each. It can be
+/// considered as the lowest unit to perform read and write operations. The idea
+/// is that each page corresponds to the physical page of a disk.
+#[derive(Debug)]
+struct PageArray {
+    data: Mmap,
+}
+
+impl PageArray {
+    /// Checks if a given page is within the bounds of the memory map
+    fn check_bounds(&self, id: PageId) {
+        assert!(self.data.len() >= OS_PAGE_SIZE * id as usize);
+    }
+
+    /// Returns a pointer to the specific page of the mapped memory.
+    fn page_ptr(&self, id: PageId) -> *const u8 {
+        if id == 0 {
+            return self.data.ptr();
+        }
+        self.check_bounds(id);
+        let offset = OS_PAGE_SIZE as isize * id as isize;
+        unsafe { self.data.ptr().offset(offset) }
+    }
+
+    /// Returns a mut pointer to the specific page of the mapped memory.
+    unsafe fn page_mut_ptr(&mut self, id: PageId) -> *mut u8 {
+        if id == 0 {
+            return self.data.mut_ptr();
+        }
+        self.check_bounds(id);
+        let offset = OS_PAGE_SIZE as isize * id as isize;
+        self.data.mut_ptr().offset(offset)
+    }
+
+    /// Return the page info for a page with the given Id
+    fn get_page_info(&self, id: PageId) -> PageInfo {
+        PageInfo {
+            ptr: self.page_ptr(id),
+            id: id,
+        }
+    }
+}
+
+
 /// A page is usually 4096 bytes and maps to a block on the physical disk. Since
 /// we are using mmap this will point to a location on the mmap.
 ///
@@ -274,24 +278,19 @@ bitflags! {
 ///    --------------------------------------------------------------------------
 ///   | flags (32) | overflow page (32) | page specific data (4096 - 64 = 4032) |
 ///   --------------------------------------------------------------------------
-
-const OFFSET_OVERFLOW: isize = 32;
-const OFFSET_PAGEDATA: isize = 64;
-
-struct Page {
+#[derive(Debug, Clone, Copy)]
+struct PageInfo {
     ptr: PagePtr,
     id: PageId,
 }
 
-impl Page {
-    /// Create a new page from the pointer
-    fn new(id: PageId, ptr: MutPagePtr) -> Page {
-        Page { ptr: ptr, id: id }
-    }
+const PI_OFFSET_OVERFLOW: isize = 32;
+const PI_OFFSET_PAGEDATA: isize = 64;
 
+impl PageInfo {
     /// Returns the overflow page if one exists
     fn overflow_page(&self) -> Option<PageId> {
-        match from_ptr_with_offset::<PageId>(self.ptr, OFFSET_OVERFLOW) {
+        match enc::from_ptr_with_offset::<PageId>(self.ptr, PI_OFFSET_OVERFLOW) {
             x if x > 0 => Some(x),
             _ => None,
         }
@@ -299,33 +298,73 @@ impl Page {
 
     /// Returns the type of the page from the pointer to the beginning of the page
     fn page_flags(&self) -> PageFlags {
-        from_ptr(self.ptr)
+        enc::from_ptr(self.ptr)
     }
 }
 
-/// PageArray contains pointers to the first element of each data page. Page are
-/// 4096 bytes and can contain upto 200 keys. So, PageArray will have pointers
+/// PageIndex contains pointers to the first element of each data page. Page are
+/// 4096 bytes and can contain upto 200 keys. So, PageIndex will have pointers
 /// to each of the valid pages in the system.
 /// A level can span across multiple pages. It offers functionality similar to
 /// a skiplist level but does use probablity to determine which keys should be promoted
 /// to higher level. In this sense it allows faster search using Binary search.
 ///
-/// Due to the inherent array like nature these offer O(1) access to an element.
+/// Due to the inherent array like nature these offer O(1) access to an element. The
+/// elements are sorted
+///
+/// Page layout in memory
+///
+///    --------------------------------------------------------------------------
+///   | header (64) | length (64) | value 0.....n (32 bytes each, n = 124)      |
+///   --------------------------------------------------------------------------
+/// So, we can store upto 124 pointers in a single array. This may not seem much
+/// but this covers total 124 * 50 keys/kb * 4 page size = 24,800 (considering 20kb/key)
 #[derive(Debug)]
-struct PageArray {
+struct PageIndex<'a> {
     /// Pointers to all the data pages
-    page_ptrs: Vec<*const u8>,
+    page_ptrs: Vec<PageInfo>,
     /// Overall capactity across all the pages
     capacity: i64,
     /// Currently occupied elements
     length: i64,
+    ///
+    pa: &'a PageArray,
 }
 
-impl PageArray {
-    fn new(ptr: PagePtr) -> PageArray {
-        //assert!(Db::page_type_from_ptr(ptr) == PAGE_LOOKUP);
-        // Lookup { page: vec![page], capacity: 0, length: 0, element: vec![] }
-        unimplemented!()
+const PI_OFFSET_LENGTH: isize = 64;
+const PI_KEYS_PER_PAGE: usize = 124;
+
+impl<'a> PageIndex<'a> {
+    fn length(page: PageInfo) -> u32 {
+        enc::from_ptr_with_offset::<PageId>(page.ptr, PI_OFFSET_LENGTH)
+    }
+
+    fn new(page: PageInfo, pa: &'a PageArray) -> PageIndex {
+        let mut pages = vec![];
+        let mut p = Some(page);
+        let mut length = 0;
+        loop {
+            match p {
+                Some(p1) => {
+                    pages.push(p1);
+                    length += PageIndex::length(p1);
+
+                    // Grab the next page, if it is found then load it
+                    match p1.overflow_page() {
+                        Some(next_page) => p = Some(pa.get_page_info(next_page)),
+                        None => break,
+                    }
+                }
+                None => break,
+            }
+        }
+
+        let capacity = (pages.len() * PI_KEYS_PER_PAGE) as i64;
+        PageIndex {
+            page_ptrs: pages,
+            capacity: capacity,
+            length: length as i64,
+            pa: pa,
+        }
     }
 }
-

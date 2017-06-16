@@ -1,3 +1,5 @@
+use std::mem;
+
 // Operating system page size. Ideally this should be populated
 // dyanimically.
 pub const OS_PAGE_SIZE: usize = 4096;
@@ -19,9 +21,11 @@ pub const MIN_KEYS_PER_PAGE: u16 = 2;
 // There's nothing special about this value other than that it is easily
 // recognizable, and it will reflect any byte order mismatches.
 pub const MAGIC_KEY: u32 = 0xBADC0DE;
+pub const MAGIC_KEY_SIZE: u64 = 32;
 
 // The data file format version.
 pub const VERSION: u32 = 1;
+pub const VERSION_SIZE: u64 = 32;
 
 // MaxKeySize is the maximum length of a key, in bytes. The database is
 // idelly suited for smaller keys as we will be able to cahce more keys in
