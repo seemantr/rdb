@@ -212,9 +212,12 @@ pub fn decode_varint_u64(p: *const u8) -> u64 {
         200 + ((b0 - 201) << 8) as u64 + b1(p) as u64
     } else {
         let bytes = b0 - VARINT_CUT2 + 2;
-        let mut v: u64 = 0;
+        
+        // Here we have unrolled the first iteration of the loop
+        let mut v: u64 = from_ptr_with_offset::<u8>(p, 1) as u64;
+        
         //trace!("Decoder: bytes:{}, b0:{}", bytes, b0);
-        for i in 1..bytes + 1 {
+        for i in 2..bytes + 1 {
             b0 = from_ptr_with_offset::<u8>(p, i as isize) as u64;
             v |= b0 << (8 * (i - 1));
             //trace!("Decoder: b{}:{}", i, v);
