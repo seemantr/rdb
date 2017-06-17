@@ -170,10 +170,11 @@ pub fn encode_varint_u64(p: *const u8, v: u64) -> u64 {
     let mut v = v;
     if v < VARINT_CUT1 {
         encode_with_offset(p, 0, v as u8);
-        return 1;
+        1
     } else if v < 12488 {
-        encode_with_offset(p, 0, ((v - 200) / 256 + VARINT_CUT1) as u8);
-        encode_with_offset(p, 1, ((v - 200) % 256) as u8);
+        v -= 200;
+        encode_with_offset(p, 0, ((v >> 8) + VARINT_CUT1) as u8);
+        encode_with_offset(p, 1, (v & 255) as u8);
         2
     } else {
         // 3-9 bytes
@@ -181,7 +182,7 @@ pub fn encode_varint_u64(p: *const u8, v: u64) -> u64 {
         let bytes = (bits + 7) / 8;
         let b0 = VARINT_CUT2 + (bytes as u64 - 2);
         //trace!("Encoder: input:{}, bits:{}, bytes:{}, b0:{}", v, bits, bytes, b0);
-        encode_with_offset(p, 0, b0 as u8);
+        encode(p, b0 as u8);
         for i in 1..bytes + 1 {
             encode_with_offset(p, i as u64, v as u8);
             //trace!("Encoder: b{}:{}", i, v as u8);
@@ -208,7 +209,7 @@ pub fn decode_varint_u64(p: *const u8) -> u64 {
     if b0 < VARINT_CUT1 {
         b0 as u64
     } else if b0 < VARINT_CUT2 {
-        200 + 256 * (b0 - 201) as u64 + b1(p) as u64
+        200 + ((b0 - 201) << 8) as u64 + b1(p) as u64
     } else {
         let bytes = b0 - VARINT_CUT2 + 2;
         let mut v: u64 = 0;
