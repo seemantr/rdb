@@ -1,74 +1,74 @@
 use std::{mem, ptr, slice};
 
 /// Get the raw byte representation of a struct
-#[inline(always)]
+#[inline]
 unsafe fn to_slice<'a, T>(p: *const u8) -> &'a [u8] {
     slice::from_raw_parts(p, mem::size_of::<T>())
 }
 
 /// Create an struct from the pointer
-#[inline(always)]
+#[inline]
 pub fn from_ptr<T>(p: *const u8) -> T {
     unsafe { ptr::read(p as *const T) }
 }
 
 /// Create an struct from the pointer
-#[inline(always)]
-pub fn from_ptr_with_offset<T>(p: *const u8, offset: isize) -> T {
-    unsafe { ptr::read(p.offset(offset) as *const T) }
+#[inline]
+pub fn from_ptr_with_offset<T>(p: *const u8, offset: u64) -> T {
+    unsafe { ptr::read(p.offset(offset as isize) as *const T) }
 }
 
-#[inline(always)]
-fn u8(p: *const u8, offset: isize) -> u8 {
+#[inline]
+fn u8(p: *const u8, offset: u64) -> u8 {
     from_ptr_with_offset::<u8>(p, offset)
 }
 
-#[inline(always)]
+#[inline]
 fn b0(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 0)
 }
 
-#[inline(always)]
+#[inline]
 fn b1(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 1)
 }
 
-#[inline(always)]
+#[inline]
 fn b2(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 2)
 }
 
-#[inline(always)]
+#[inline]
 fn b3(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 3)
 }
 
-#[inline(always)]
+#[inline]
 fn b4(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 4)
 }
 
-#[inline(always)]
+#[inline]
 fn b5(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 5)
 }
 
-#[inline(always)]
+#[inline]
 fn b6(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 6)
 }
 
-#[inline(always)]
+#[inline]
 fn b7(p: *const u8) -> u8 {
     from_ptr_with_offset::<u8>(p, 7)
 }
 
-#[inline(always)]
+#[inline]
 pub fn encode<T>(p: *const u8, v: T) {
     encode_with_offset(p, 0, v)
 }
 
-#[inline(always)]
+#[inline]
 pub fn encode_with_offset<T>(p: *const u8, offset: u64, v: T) {
     unsafe { ptr::write(p.offset(offset as isize) as *mut T, v) }
 }
@@ -147,7 +147,7 @@ pub fn decode_leb_u32(p: *const u8) -> u32 {
 const VARINT_CUT1: u64 = 201;
 const VARINT_CUT2: u64 = 249;
 
-/// This encoding is inspired by SQLite var encoding with minor differences.
+/// This encoding is inspired by `SQLite var encoding with minor differences.
 /// The maximum value represented by 2 bytes is higher than sqlite varint
 /// as we want to represnt atleast a value of 4096 using 2 bytes. This is to
 /// ensure that any place in a page (4096 bytes) can be addressed using 2 bytes
@@ -165,31 +165,50 @@ const VARINT_CUT2: u64 = 249;
 /// V <= 281474976710655    => b0 = 253; [b1..b6] = 6 byte integer
 /// V <= 72057594037927935  => b0 = 254; [b1..b7] = 7 byte integer
 /// V                       => b0 = 255; [b1..b8] = 8 byte integer
+///
+/// Based upon https://github.com/stoklund/varint/blob/master/lesqlite.cpp
 #[inline]
 pub fn encode_varint_u64(p: *const u8, v: u64) -> u64 {
     let mut v = v;
     if v < VARINT_CUT1 {
         encode_with_offset(p, 0, v as u8);
-        1
-    } else if v < 12488 {
+        return 1;
+    } else if v < VARINT_CUT1 + 255 + 256 * (VARINT_CUT2 - VARINT_CUT1 - 1) {
         v -= 200;
         encode_with_offset(p, 0, ((v >> 8) + VARINT_CUT1) as u8);
         encode_with_offset(p, 1, (v & 255) as u8);
-        2
-    } else {
-        // 3-9 bytes
-        let bits = 64 - v.leading_zeros();
-        let bytes = (bits + 7) / 8;
-        let b0 = VARINT_CUT2 + (bytes as u64 - 2);
-        //trace!("Encoder: input:{}, bits:{}, bytes:{}, b0:{}", v, bits, bytes, b0);
-        encode(p, b0 as u8);
-        for i in 1..bytes + 1 {
-            encode_with_offset(p, i as u64, v as u8);
-            //trace!("Encoder: b{}:{}", i, v as u8);
-            v >>= 8;
-        }
-        bytes as u64
+        return 2;
     }
+
+    /*
+    let bits = 64 - v.leading_zeros();
+    let bytes_needed = (bits + 7) / 8;
+    let b0 = VARINT_CUT2 + (bytes_needed as u64 - 2);
+    let bytes: [u8; 8] = unsafe { mem::transmute(v) };
+    encode(p, b0 as u8);
+    
+    //debug!!("Encoder: input:{}, bits:{}, bytes_needed:{}, bytes:{:?}, b0:{}", v, bits, bytes_needed, bytes, b0);
+
+    unsafe {
+        ptr::copy_nonoverlapping(bytes[0 .. bytes_needed as usize].as_ptr(),
+                                 p.offset(1) as *mut u8,
+                                 bytes_needed as usize);
+    }
+    bytes_needed as u64
+    */
+    
+    // 3-9 bytes
+    let bits = 64 - v.leading_zeros();
+    let bytes = (bits + 7) / 8;
+    let b0 = VARINT_CUT2 + (bytes as u64 - 2);
+    //trace!("Encoder: input:{}, bits:{}, bytes:{}, b0:{}", v, bits, bytes, b0);
+    encode(p, b0 as u8);
+    for i in 1..bytes + 1 {
+        encode_with_offset(p, i as u64, v as u8);
+        //trace!("Encoder: b{}:{}", i, v as u8);
+        v >>= 8;
+    }
+    bytes as u64
 }
 
 /// Decodes a varint
@@ -207,24 +226,36 @@ pub fn encode_varint_u64(p: *const u8, v: u64) -> u64 {
 pub fn decode_varint_u64(p: *const u8) -> u64 {
     let mut b0 = b0(p) as u64;
     if b0 < VARINT_CUT1 {
-        b0 as u64
+        return b0;
     } else if b0 < VARINT_CUT2 {
-        200 + ((b0 - 201) << 8) as u64 + b1(p) as u64
-    } else {
-        let bytes = b0 - VARINT_CUT2 + 2;
-        
-        // Here we have unrolled the first iteration of the loop
-        let mut v: u64 = from_ptr_with_offset::<u8>(p, 1) as u64;
-        
-        //trace!("Decoder: bytes:{}, b0:{}", bytes, b0);
-        for i in 2..bytes + 1 {
-            b0 = from_ptr_with_offset::<u8>(p, i as isize) as u64;
-            v |= b0 << (8 * (i - 1));
-            //trace!("Decoder: b{}:{}", i, v);
-        }
-        //trace!("Decoder: output:{}, bytes:{}", v, bytes);
-        v
+        return VARINT_CUT1 - 1 + ((b0 - VARINT_CUT1) << 8) as u64 + b1(p) as u64;
     }
+
+    /*
+    let bytes_needed = b0 - VARINT_CUT2 + 2;
+    let v : [u8; 8] = [0 ; 8];
+    
+    //debug!("Decoder: bytes:{}, b0:{}", bytes_needed, b0);
+    unsafe { 
+        ptr::copy_nonoverlapping(p.offset(1),
+                                 v.as_ptr()  as *mut u8,
+                                 bytes_needed as usize);
+        mem::transmute(v) }
+    */
+    
+    let bytes = b0 - VARINT_CUT2 + 2;
+
+    // Here we have unrolled the first iteration of the loop
+    let mut v: u64 = from_ptr_with_offset::<u8>(p, 1) as u64;
+
+    trace!("Decoder: bytes:{}, b0:{}", bytes, b0);
+    for i in 2..bytes + 1 {
+        b0 = from_ptr_with_offset::<u8>(p, i) as u64;
+        v |= b0 << (8 * (i - 1));
+        trace!("Decoder: b{}:{}", i, v);
+    }
+    trace!("Decoder: output:{}, bytes:{}", v, bytes);
+    v
 }
 
 #[cfg(test)]
@@ -279,6 +310,32 @@ mod tests {
         assert_eq!(decode_leb_u32(target.as_ptr()), sut);
     }
 
+    unsafe fn ptr_offset(p: *const u8, offset: isize) -> *const u8 {
+        p.offset(offset)
+    }
+
+    //#[test]
+    fn can_encode_and_decode_series_of_numbers_varint() {
+        let _ = env_logger::init();
+        let target = [0 as u8; 1000];
+        let mut offsets = [0 as isize; 101];
+        for i in 1..100 {
+            offsets[i] = unsafe {
+                encode_varint_u64(ptr_offset(target.as_ptr(), offsets[i - 1]), i as u64) as isize
+            };
+            debug!("i={},width={}", i, offsets[i]);
+        }
+
+        let mut offset = 0;
+        for i in 1..100 {
+            unsafe {
+                assert_eq!(decode_varint_u64(ptr_offset(target.as_ptr(), offset)),
+                           i as u64);
+            }
+            offset += offsets[i - 1];
+        }
+    }
+
     //#[bench]
     fn bench_encode_leb_u32(b: &mut Bencher) {
         let target = [0 as u8; 4];
@@ -298,16 +355,16 @@ mod tests {
     /// Having a common method will ensure that all the encoding types are
     /// tested using the same style.
     fn encode_decode_range(enc: EncoderDecoder,
-                           fullRange: bool,
-                           testSubset: bool,
-                           smallNumbers: bool,
-                           largeNumber: bool,
+                           full_range: bool,
+                           test_subset: bool,
+                           small_numbers: bool,
+                           large_numbers: bool,
                            decode: bool,
-                           testVector: bool)
+                           test_vector: bool)
                            -> Vec<[u8; 8]> {
         let EncoderDecoder(enc, dec) = enc;
         let mut encoded = vec![];
-        if fullRange {
+        if full_range {
             for sut in 0..1000000 {
                 let target = [0 as u8; 8];
                 let res = enc(target.as_ptr(), sut);
@@ -317,7 +374,7 @@ mod tests {
             }
         }
 
-        if testSubset {
+        if test_subset {
             for sut in TEST_NUMBERS.iter() {
                 let target = [0 as u8; 8];
                 let res = enc(target.as_ptr(), *sut);
@@ -327,11 +384,11 @@ mod tests {
             }
         }
 
-        if smallNumbers {
+        if small_numbers {
             for sut in TEST_NUMBERS.iter().take(15) {
                 let target = [0 as u8; 8];
                 let res = enc(target.as_ptr(), *sut);
-                if testVector {
+                if test_vector {
                     encoded.push(target);
                 }
                 if decode {
@@ -340,11 +397,11 @@ mod tests {
             }
         }
 
-        if largeNumber {
+        if large_numbers {
             for sut in TEST_NUMBERS.iter().skip(15) {
                 let target = [0 as u8; 8];
                 let res = enc(target.as_ptr(), *sut);
-                if testVector {
+                if test_vector {
                     encoded.push(target);
                 }
                 if decode {
@@ -370,8 +427,19 @@ mod tests {
         full_test_suite(ENC_LEB128);
     }
 
-    fn bench_encode(enc: EncoderDecoder, smallNumbers: bool, largeNumbers: bool, b: &mut Bencher) {  
-        b.iter(|| encode_decode_range(enc, false, false, smallNumbers, largeNumbers, false, false))
+    fn bench_encode(enc: EncoderDecoder,
+                    small_numbers: bool,
+                    large_numbers: bool,
+                    b: &mut Bencher) {
+        b.iter(|| {
+            encode_decode_range(enc,
+                                false,
+                                false,
+                                small_numbers,
+                                large_numbers,
+                                false,
+                                false)
+        })
     }
 
     /*
@@ -397,11 +465,14 @@ mod tests {
         bench_encode(ENC_VARINT, false, true, b);
     }
 
-    fn bench_decode(enc: EncoderDecoder, smallNumbers: bool, largeNumbers: bool, b: &mut Bencher) {
+    fn bench_decode(enc: EncoderDecoder,
+                    small_numbers: bool,
+                    large_numbers: bool,
+                    b: &mut Bencher) {
         let encoded =
-            encode_decode_range(enc, false, false, smallNumbers, largeNumbers, false, true);
+            encode_decode_range(enc, false, false, small_numbers, large_numbers, false, true);
         let mut res = 0;
-        let EncoderDecoder(enc, dec) = enc;
+        let EncoderDecoder(_, dec) = enc;
         b.iter(|| for sut in encoded.iter() {
                    res = dec(sut.as_ptr());
                })

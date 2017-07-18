@@ -1,5 +1,5 @@
 [package]
-name = "skipdb"
+name = "jumpdb"
 version = "0.1.0"
 authors = ["Seemant Rajvanshi <seemant.rajvanshi@gmail.com>"]
 repository = "https://github.com/seemantr/rdb.git"
@@ -12,7 +12,10 @@ memmap = "0.5.2"
 lazy_static = "0.2.8"
 bitflags = "0.8.2"
 fs2 = "0.4.1"
-log = "0.3.8"
+
+[dependencies.log]
+version = "*"
+features = ["max_level_debug", "release_max_level_warn"]
 
 [dev-dependencies]
 quickcheck = "*"

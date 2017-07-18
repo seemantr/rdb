@@ -210,9 +210,9 @@ bitflags! {
         /// Metadata page which contains the location of the lookup page
         const PAGE_META      = 1,
         /// Page which contains the array lookup to the list pages
-        const PAGE_INDEX     = 2,
+        const PAGE_JUMPLIST  = 2,
         /// Page containg the actual skip list
-        const PAGE_LIST      = 4,
+        const PAGE_KEYS      = 4,
         /// Page which contains the information about the free pages
         const PAGE_FREELIST  = 8,
         /// Page containing the value data
@@ -284,8 +284,8 @@ struct PageInfo {
     id: PageId,
 }
 
-const PI_OFFSET_OVERFLOW: isize = 32;
-const PI_OFFSET_PAGEDATA: isize = 64;
+const PI_OFFSET_OVERFLOW: u64 = 32;
+const PI_OFFSET_PAGEDATA: u64 = 64;
 
 impl PageInfo {
     /// Returns the overflow page if one exists
@@ -331,7 +331,7 @@ struct PageIndex<'a> {
     pa: &'a PageArray,
 }
 
-const PI_OFFSET_LENGTH: isize = 64;
+const PI_OFFSET_LENGTH: u64 = 64;
 const PI_KEYS_PER_PAGE: usize = 124;
 
 impl<'a> PageIndex<'a> {

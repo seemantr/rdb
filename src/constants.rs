@@ -1,5 +1,3 @@
-use std::mem;
-
 // Operating system page size. Ideally this should be populated
 // dyanimically.
 pub const OS_PAGE_SIZE: usize = 4096;
